@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "chai-87874"
+    "production": "chai-87874",
+    "testing": "chaibeta-5763f"
   }
 }

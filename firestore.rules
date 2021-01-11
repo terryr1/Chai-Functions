@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /conversations/{conversationId} {
+    	allow read: if request.auth.uid == resource.data.uid
+      
+      allow read: if resource.data.pending == true && request.auth != null
+      allow read: if resource.data.new_uid == request.auth.uid
+                    
+      match /messages/{messageId} {
+      
+        function isInThisConvo(convo_data, uid) {
+            return convo_data.uid == uid || convo_data.new_uid == uid;
+        }
+      
+      	allow read: if isInThisConvo(get(/databases/$(database)/documents/conversations/$(conversationId)).data, request.auth.uid)
+      }
+    }
+    match /users/{userId} {
+      allow read, delete: if userId == request.auth.uid
+    }
+  }
+}

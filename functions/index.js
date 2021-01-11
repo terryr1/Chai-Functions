@@ -2,6 +2,8 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const Filter = require("bad-words");
 const { Expo } = require("expo-server-sdk");
+const perspective = require("./perspective");
+const franc = require("franc");
 
 admin.initializeApp();
 
@@ -25,36 +27,42 @@ const sendNotifications = async (messages) => {
   return Promise.all(promises);
 };
 
-const notifyRandomUser = async (originalUid, question, convo_id) => {
+const notifyRandomUser = async (originalUid, question, convo_id, random_ids) => {
   const statsDoc = db.collection("users").doc("stats");
   await db.runTransaction(async (t) => {
     const userStats = await t.get(statsDoc);
 
     let randomUser = userStats.data().next_id;
 
-    if (randomUser === originalUid && randomUser + 1 <= userStats.data().count) {
-      randomUser += 1;
+    const numUsersToNotify = userStats.data().count > 15 ? 15 : 1;
+    if (randomUser === originalUid && randomUser + numUsersToNotify <= userStats.data().count) {
+      randomUser += numUsersToNotify;
     } else if (randomUser === originalUid) {
       randomUser = 1;
     }
 
-    console.log(randomUser);
+    t.set(statsDoc, { next_id: ((randomUser + numUsersToNotify + 1) % userStats.data().count) + 1 }, { merge: true });
 
-    t.set(statsDoc, { next_id: randomUser + 1 <= userStats.data().count ? randomUser + 1 : 1 }, { merge: true });
-
-    const querySnapshot = await db.collection("users").where("random_id", "==", randomUser).limit(1).get();
+    const querySnapshot = await db
+      .collection("users")
+      .where("random_id", ">=", randomUser)
+      .limit(numUsersToNotify)
+      .get();
 
     querySnapshot.forEach((doc) => {
-      const token = doc.data().notification_token;
-      if (Expo.isExpoPushToken(token)) {
-        sendNotifications([
-          {
-            to: token,
-            title: "Care to share your wisdom?",
-            body: question,
-            data: { convo_id: convo_id, pending: true, primary: false },
-          },
-        ]);
+      if (doc.data().random_id !== originalUid && (random_ids ? !random_ids.includes(doc.data().random_id) : true)) {
+        console.log(`${originalUid} sending to ${doc.data().random_id}`);
+        const token = doc.data().notification_token;
+        if (Expo.isExpoPushToken(token)) {
+          sendNotifications([
+            {
+              to: token,
+              title: "Care to share your wisdom?",
+              body: question,
+              data: { convo_id: convo_id, pending: true, primary: false },
+            },
+          ]);
+        }
       }
     });
   });
@@ -78,12 +86,17 @@ exports.deleteMessages = functions.firestore.document("/conversations/{documentI
 exports.checkIfUserBanned = functions.firestore.document("/reports/{documentId}").onUpdate(async (change, context) => {
   const after = change.after.data();
 
-  if (after.reports.length > 20) {
+  if (after.reports.length > 6) {
     const userDoc = await db.collection("users").doc(context.params.documentId).get();
     const token = userDoc.data().notification_token;
     if (Expo.isExpoPushToken(token)) {
       sendNotifications([
-        { to: token, title: "Banned", body: "You've been reported multiple times and are now banned" },
+        {
+          to: token,
+          title: "Banned",
+          body:
+            "You've been reported multiple times and are now banned. If you think this was a mistake contact us at chaitheapp@gmail.com",
+        },
       ]);
     }
 
@@ -98,14 +111,19 @@ exports.createUser = functions.auth.user().onCreate(async (user) => {
 
   const uid = await db.runTransaction(async (t) => {
     const stats = await t.get(statsDoc);
-    t.set(statsDoc, { count: stats.data().count + 1 });
+    let count = stats.data() ? stats.data().count : 0;
+    if (!stats.data()) {
+      t.create(statsDoc, { count: 1 });
+    } else {
+      t.set(statsDoc, { count: count + 1 }, { merge: true });
+    }
     return db
       .collection("users")
       .doc(user.uid)
       .set({
         conversations: [],
         rating: 0,
-        random_id: stats.data().count + 1,
+        random_id: count + 1,
       });
   });
 
@@ -121,7 +139,29 @@ exports.createConvo = functions.https.onCall(async (data, context) => {
     return false;
   }
 
-  const question = filter.clean(data.question);
+  const perspectiveResult = await perspective.getPerspective(data.question);
+
+  if (perspectiveResult && perspectiveResult.attributeScores) {
+    if (perspectiveResult.attributeScores.TOXICITY.summaryScore.value > 0.7) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Your question was marked as toxic, please rephrase it. The system used isn't perfect so this may be a mistake."
+      );
+    }
+  } else {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "The text you entered uses an unsupported language, please rephrase it. The system used isn't perfect so this may be a mistake."
+    );
+  }
+  const language = perspectiveResult.languages[0] === "en" ? "English" : "Other";
+
+  let question = data.question;
+  try {
+    question = filter.clean(question);
+  } catch (err) {
+    console.log(err);
+  }
 
   if (question.length > 200) {
     throw new functions.https.HttpsError("invalid-argument", "Your question can't be more than 200 characters long");
@@ -129,11 +169,21 @@ exports.createConvo = functions.https.onCall(async (data, context) => {
 
   const currentUser = await db.collection("users").doc(uid).get();
 
-  const numConvos = Object.keys(currentUser.data().conversations).length;
-  if (numConvos >= 10) {
+  if (currentUser.data().conversations.length >= 25) {
     throw new functions.https.HttpsError(
       "invalid-argument",
-      "You can't create more than 10 conversations at the same time, resolve an existing conversation to continue"
+      "You can't be in more than 25 conversations at the same time, resolve an existing conversation to continue."
+    );
+  }
+
+  //bug here
+  const createdConvos = Object.values(currentUser.data().conversations).filter((convo) => convo.primary);
+  const numConvos = createdConvos.length;
+  if (numConvos >= 5) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "You can't create more than 5 conversations at the same time, resolve a conversation you previously created to continue." +
+        " You can also join someone else's conversation in the explore tab."
     );
   }
 
@@ -151,10 +201,13 @@ exports.createConvo = functions.https.onCall(async (data, context) => {
   const convoDoc = db.collection("conversations").doc();
   batch.set(convoDoc, {
     question: question,
+    category: data.category ? data.category : "No Category :(",
+    language,
     pending_messages: [message],
     timestamp: admin.firestore.Timestamp.now(),
     uid,
     old_uids: [],
+    random_ids: [],
     pending: true,
   });
 
@@ -163,7 +216,7 @@ exports.createConvo = functions.https.onCall(async (data, context) => {
     db.collection("users").doc(uid),
     {
       conversations: {
-        [id]: { question: question, unread: false, primary: true },
+        [id]: { question: question, unread: false, primary: true, last_updated: admin.firestore.Timestamp.now() },
       },
     },
     { merge: true }
@@ -182,7 +235,7 @@ exports.markRead = functions.https.onCall(async (data, context) => {
   const doc = db.collection("users").doc(uid);
   return db.runTransaction(async (t) => {
     const user = await t.get(doc);
-    if (user.data().conversations[data.convo_id].unread) {
+    if (user.data().conversations[data.convo_id] ? user.data().conversations[data.convo_id].unread : false) {
       return t.set(
         db.collection("users").doc(uid),
         {
@@ -206,7 +259,12 @@ exports.createMessage = functions.https.onCall(async (data, context) => {
     const convo = await transaction.get(convDoc);
 
     if (convo.data().uid === uid || convo.data().new_uid === uid) {
-      const text = filter.clean(data.text);
+      let text = data.text;
+      try {
+        text = filter.clean(text);
+      } catch (err) {
+        console.log(err);
+      }
       const to_uid = convo.data().uid === uid ? convo.data().new_uid : convo.data().uid;
       if (to_uid) {
         const userDoc = db.collection("users").doc(to_uid);
@@ -214,6 +272,7 @@ exports.createMessage = functions.https.onCall(async (data, context) => {
 
         const token = userToBeNotified.data().notification_token;
         if (Expo.isExpoPushToken(token)) {
+          console.log("create message sent notif");
           sendNotifications([
             {
               to: token,
@@ -223,6 +282,14 @@ exports.createMessage = functions.https.onCall(async (data, context) => {
             },
           ]);
         }
+
+        transaction.set(
+          db.collection("users").doc(uid),
+          {
+            conversations: { [data.convo_id]: { last_updated: admin.firestore.Timestamp.now() } },
+          },
+          { merge: true }
+        );
 
         return createMessageHelper(
           {
@@ -246,7 +313,7 @@ async function createMessageHelper(data, transaction) {
     transaction.set(
       db.collection("users").doc(data.other_uid),
       {
-        conversations: { [data.convo_id]: { unread: true } },
+        conversations: { [data.convo_id]: { unread: true, last_updated: admin.firestore.Timestamp.now() } },
       },
       { merge: true }
     );
@@ -271,7 +338,19 @@ exports.createPendingMessage = functions.https.onCall(async (data, context) => {
     const doc = await transaction.get(convoDoc);
 
     if (doc.data().uid === uid) {
-      const text = filter.clean(data.text);
+      let text = data.text;
+      try {
+        text = filter.clean(text);
+      } catch (err) {
+        console.log(err);
+      }
+      transaction.set(
+        db.collection("users").doc(uid),
+        {
+          conversations: { [data.convo_id]: { last_updated: admin.firestore.Timestamp.now() } },
+        },
+        { merge: true }
+      );
       return transaction.update(convoDoc, {
         pending_messages: admin.firestore.FieldValue.arrayUnion({
           _id: data.message_id,
@@ -299,6 +378,9 @@ exports.removeUserFromConvo = functions.https.onCall(async (data, context) => {
 
       const user = db.collection("users").doc(uid);
       const userDoc = await transaction.get(user);
+      const convoDocData = await transaction.get(convoDoc);
+      const messagesCollection = db.collection("conversations").doc(data.convo_id).collection("messages");
+      const qs = await transaction.get(messagesCollection);
 
       promises.push(
         transaction.set(
@@ -314,7 +396,7 @@ exports.removeUserFromConvo = functions.https.onCall(async (data, context) => {
         )
       );
 
-      notifyRandomUser(userDoc.data().random_id, doc.data().question, data.convo_id);
+      notifyRandomUser(userDoc.data().random_id, doc.data().question, data.convo_id, convoDocData.data().random_ids);
 
       const newUser = db.collection("users").doc(doc.data().new_uid);
 
@@ -334,13 +416,11 @@ exports.removeUserFromConvo = functions.https.onCall(async (data, context) => {
         transaction.set(
           user,
           {
-            conversations: { [data.convo_id]: { unread: false } },
+            conversations: { [data.convo_id]: { unread: false, last_updated: admin.firestore.Timestamp.now() } },
           },
           { merge: true }
         )
       );
-
-      const qs = await db.collection("conversations").doc(data.convo_id).collection("messages").get();
 
       qs.forEach((docSnapshot) => {
         transaction.delete(docSnapshot.ref);
@@ -359,11 +439,29 @@ exports.addUserToConvo = functions.https.onCall(async (data, context) => {
   const uid = decodedToken.uid;
 
   const convoDoc = db.collection("conversations").doc(data.convo_id);
+  const userDoc = db.collection("users").doc(uid);
   return db.runTransaction(async (transaction) => {
     const doc = await transaction.get(convoDoc);
+    const userData = await transaction.get(userDoc);
 
-    if (doc.data().pending && !doc.data().old_uids.includes(uid)) {
-      transaction.set(convoDoc, { pending: false, new_uid: uid }, { merge: true });
+    if (userData.data().conversations.length >= 25) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "You can't be in more than 25 conversations at the same time, resolve an existing conversation to continue."
+      );
+    }
+
+    if (doc.data().pending && !doc.data().old_uids.includes(uid) && uid !== doc.data().uid) {
+      transaction.set(
+        convoDoc,
+        {
+          pending: false,
+          new_uid: uid,
+          modified_timestamp: admin.firestore.Timestamp.now(),
+          random_ids: admin.firestore.FieldValue.arrayUnion(userData.data().random_id),
+        },
+        { merge: true }
+      );
 
       doc.data().pending_messages.forEach((message) => {
         createMessageHelper(
@@ -378,10 +476,28 @@ exports.addUserToConvo = functions.https.onCall(async (data, context) => {
         );
       });
 
+      createMessageHelper(
+        {
+          convo_id: data.convo_id,
+          text: data.firstMessage.text,
+          uid: uid,
+          timestamp: admin.firestore.Timestamp.now(),
+          message_id: data.firstMessage._id,
+        },
+        transaction
+      );
+
       transaction.set(
         db.collection("users").doc(uid),
         {
-          conversations: { [data.convo_id]: { question: doc.data().question, unread: false, primary: false } },
+          conversations: {
+            [data.convo_id]: {
+              question: doc.data().question,
+              unread: false,
+              primary: false,
+              last_updated: admin.firestore.Timestamp.now(),
+            },
+          },
         },
         { merge: true }
       );
@@ -517,4 +633,79 @@ exports.deleteConvo = functions.https.onCall(async (data, context) => {
     }
     return false;
   });
+});
+
+exports.resetConvosDaily = functions.pubsub.schedule("every 5 minutes").onRun(async (context) => {
+  const today = new Date();
+  const day = 86400000; //number of milliseconds in a day
+  const oneDayAgo = new Date(today - day);
+  const betaEndDate = new Date(Date.parse("1/8/2021"));
+
+  const querySnapshot = await db
+    .collection("conversations")
+    .where("pending", "==", false)
+    .where("modified_timestamp", "<", oneDayAgo)
+    .where("modified_timestamp", ">", betaEndDate)
+    .get();
+
+  querySnapshot.forEach((doc) => {
+    console.log(doc.data().question);
+    return db.runTransaction(async (transaction) => {
+      const promises = [];
+
+      const convoDoc = db.collection("conversations").doc(doc.id);
+      const user = db.collection("users").doc(doc.data().uid);
+      const userDoc = await transaction.get(user);
+      const convoDocData = await transaction.get(convoDoc);
+
+      promises.push(
+        transaction.set(
+          convoDoc,
+          doc.data().new_uid
+            ? {
+                pending: true,
+                new_uid: null,
+                old_uids: admin.firestore.FieldValue.arrayUnion(doc.data().new_uid),
+              }
+            : { pending: true, new_uid: null },
+          { merge: true }
+        )
+      );
+
+      notifyRandomUser(userDoc.data().random_id, doc.data().question, doc.id, convoDocData.data().random_ids);
+
+      const newUser = db.collection("users").doc(doc.data().new_uid);
+
+      if (doc.data().new_uid) {
+        promises.push(
+          transaction.set(
+            newUser,
+            {
+              conversations: { [doc.id]: admin.firestore.FieldValue.delete() },
+            },
+            { merge: true }
+          )
+        );
+      }
+
+      promises.push(
+        transaction.set(
+          user,
+          {
+            conversations: { [doc.id]: { unread: false } },
+          },
+          { merge: true }
+        )
+      );
+
+      const qs = await db.collection("conversations").doc(doc.id).collection("messages").get();
+
+      qs.forEach((docSnapshot) => {
+        transaction.delete(docSnapshot.ref);
+      });
+
+      return Promise.all(promises);
+    });
+  });
+  return null;
 });
